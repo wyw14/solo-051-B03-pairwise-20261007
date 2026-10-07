@@ -20,10 +20,22 @@ type ScheduledLayer struct {
 	Error      string      `json:"error,omitempty"`
 }
 
+// layerKey is the scheduling identity of one layer task. A run executes
+// many layers, so identity must include the layer number — keying by run
+// alone lets two layers of the same run collide in the running set.
+type layerKey struct {
+	runID  model.ID
+	number int
+}
+
+func keyOf(runID model.ID, layerNumber int) layerKey {
+	return layerKey{runID: runID, number: layerNumber}
+}
+
 type Scheduler struct {
 	mu       sync.Mutex
 	pending  []ScheduledLayer
-	running  map[model.ID]ScheduledLayer
+	running  map[layerKey]ScheduledLayer
 	finished []ScheduledLayer
 	limit    int
 }
@@ -32,7 +44,7 @@ func NewScheduler(limit int) *Scheduler {
 	if limit < 1 {
 		limit = 1
 	}
-	return &Scheduler{pending: make([]ScheduledLayer, 0), running: map[model.ID]ScheduledLayer{}, finished: make([]ScheduledLayer, 0), limit: limit}
+	return &Scheduler{pending: make([]ScheduledLayer, 0), running: map[layerKey]ScheduledLayer{}, finished: make([]ScheduledLayer, 0), limit: limit}
 }
 
 func (s *Scheduler) Enqueue(runID model.ID, layer model.Layer, priority int) error {
@@ -41,6 +53,17 @@ func (s *Scheduler) Enqueue(runID model.ID, layer model.Layer, priority int) err
 	}
 	item := ScheduledLayer{RunID: runID, Layer: layer, Priority: priority, EnqueuedAt: time.Now().UTC(), Status: "pending"}
 	s.mu.Lock()
+	key := keyOf(runID, layer.Number)
+	if _, ok := s.running[key]; ok {
+		s.mu.Unlock()
+		return fmt.Errorf("run %s layer %d is already running", runID, layer.Number)
+	}
+	for _, queued := range s.pending {
+		if keyOf(queued.RunID, queued.Layer.Number) == key {
+			s.mu.Unlock()
+			return fmt.Errorf("run %s layer %d is already scheduled", runID, layer.Number)
+		}
+	}
 	s.pending = append(s.pending, item)
 	sort.SliceStable(s.pending, func(i, j int) bool {
 		if s.pending[i].Priority == s.pending[j].Priority {
@@ -62,14 +85,24 @@ func (s *Scheduler) Next() (ScheduledLayer, bool) {
 	s.pending = append([]ScheduledLayer(nil), s.pending[1:]...)
 	item.Status = "running"
 	item.StartedAt = time.Now().UTC()
-	s.running[item.RunID] = item
+	s.running[keyOf(item.RunID, item.Layer.Number)] = item
 	return item, true
 }
 
 func (s *Scheduler) Finish(item ScheduledLayer, err error) ScheduledLayer {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	delete(s.running, item.RunID)
+	key := keyOf(item.RunID, item.Layer.Number)
+	if _, ok := s.running[key]; !ok {
+		// A Finish for a layer that is not currently running is stale or
+		// duplicated; recording it would corrupt counts and results.
+		item.Status = "failed"
+		if item.Error == "" {
+			item.Error = "layer was not running"
+		}
+		return item
+	}
+	delete(s.running, key)
 	item.FinishedAt = time.Now().UTC()
 	item.Status = "completed"
 	if err != nil {
